@@ -153,6 +153,12 @@
     .booking .who { font-weight: 700; font-size: 15px; }
     .booking .when { font-size: 13px; color: var(--muted); }
     .booking .room-tag { font-size: 12px; color: var(--muted); }
+    .booking .actions { display: flex; gap: 6px; }
+    .edit {
+      border: 1px solid var(--line); background: #fff; color: var(--olive);
+      border-radius: 10px; padding: 7px 12px; font-size: 12px; cursor: pointer; font-family: inherit; font-weight: 600;
+    }
+    .edit:hover { background: var(--olive-soft); border-color: #c5d1a0; }
     .del {
       border: 1px solid var(--line); background: #fff; color: var(--danger);
       border-radius: 10px; padding: 7px 12px; font-size: 12px; cursor: pointer; font-family: inherit; font-weight: 600;
@@ -163,6 +169,15 @@
     footer .heart { color: var(--terracotta); }
 
     .email-note { font-size: 12px; color: var(--muted); margin-top: 5px; }
+    .cancel-edit {
+      display: none; text-align: center; margin-top: 10px;
+      font-size: 13px; color: var(--muted); cursor: pointer; text-decoration: underline;
+    }
+    .cancel-edit:hover { color: var(--ink); }
+    .editing-banner {
+      display: none; background: var(--olive-soft); border-radius: 10px;
+      padding: 9px 13px; font-size: 13px; color: #566132; margin-bottom: 4px;
+    }
   </style>
 </head>
 <body>
@@ -209,7 +224,8 @@
 
         <!-- Form -->
         <section class="card">
-          <h2>Réservez votre séjour</h2>
+          <div class="editing-banner" id="editing-banner">✏️ Vous modifiez une réservation existante.</div>
+          <h2 id="form-title">Réservez votre séjour</h2>
 
           <label for="guest">Qui nous rend visite ?</label>
           <input id="guest" type="text" placeholder="Votre prénom" maxlength="40" />
@@ -236,6 +252,7 @@
           </div>
 
           <button class="primary" id="add">Réserver mon séjour</button>
+          <div class="cancel-edit" id="cancel-edit">Annuler la modification</div>
           <div class="msg" id="msg"></div>
         </section>
       </div>
@@ -292,12 +309,14 @@
     // =====================================================================
     const ROOM_NAMES = { "1": "Chambre 1", "2": "Chambre 2" };
     const STORAGE_KEY = "cotegarrigue_reservations";
+    const HOST_EMAIL  = "elodie.juan.julia@gmail.com";
     // Laissez vide jusqu'à ce que le backend Google Sheet soit branché.
     // Remplacez ensuite par votre URL Apps Script (se terminant par /exec).
     const SCRIPT_URL = "";
 
-    let bookings = [];
-    let viewDate = new Date();
+    let bookings   = [];
+    let editingId  = null; // null = nouveau séjour, sinon id de la résa en cours d'édition
+    let viewDate   = new Date();
     viewDate.setDate(1);
 
     function init() {
@@ -312,6 +331,7 @@
         viewDate.setMonth(viewDate.getMonth() + 1); renderCalendar();
       });
       document.getElementById("add").addEventListener("click", handleAdd);
+      document.getElementById("cancel-edit").addEventListener("click", cancelEdit);
     }
 
     // =====================================================================
@@ -340,7 +360,7 @@
       if (SCRIPT_URL) {
         const r = await fetch(SCRIPT_URL, {
           method: "POST",
-          body: JSON.stringify({ action: "add", ...entry })
+          body: JSON.stringify({ action: "add", hostEmail: HOST_EMAIL, ...entry })
         });
         return await r.json();
       }
@@ -353,9 +373,30 @@
       return { ok: true };
     }
 
-    async function deleteBooking(id) {
+    async function updateBooking(id, entry) {
       if (SCRIPT_URL) {
-        await fetch(SCRIPT_URL, { method: "POST", body: JSON.stringify({ action: "delete", id }) });
+        const r = await fetch(SCRIPT_URL, {
+          method: "POST",
+          body: JSON.stringify({ action: "update", hostEmail: HOST_EMAIL, id, ...entry })
+        });
+        return await r.json();
+      }
+      const conflict = bookings.find(b =>
+        b.id !== id && b.room === entry.room && overlaps(entry.start, entry.end, b.start, b.end)
+      );
+      if (conflict) return { ok: false, error: "conflict", by: conflict.guest };
+      bookings = bookings.map(b => b.id === id ? { ...b, ...entry } : b);
+      localSave(bookings);
+      return { ok: true };
+    }
+
+    async function deleteBooking(id) {
+      const b = bookings.find(x => x.id === id);
+      if (SCRIPT_URL) {
+        await fetch(SCRIPT_URL, {
+          method: "POST",
+          body: JSON.stringify({ action: "delete", hostEmail: HOST_EMAIL, id, guest: b?.guest, email: b?.email })
+        });
       }
       bookings = bookings.filter(b => b.id !== id);
       localSave(bookings);
@@ -437,13 +478,20 @@
             <div class="when">${fmt(b.start)} → ${fmt(b.end)}</div>
             <div class="room-tag">${ROOM_NAMES[b.room]}</div>
           </div>
-          <button class="del" data-id="${b.id}">Annuler</button>
+          <div class="actions">
+            <button class="edit" data-id="${b.id}">Modifier</button>
+            <button class="del"  data-id="${b.id}">Annuler</button>
+          </div>
         `;
         list.appendChild(row);
+      });
+      list.querySelectorAll(".edit").forEach(btn => {
+        btn.addEventListener("click", () => startEdit(btn.getAttribute("data-id")));
       });
       list.querySelectorAll(".del").forEach(btn => {
         btn.addEventListener("click", async () => {
           if (!confirm("Annuler ce séjour ?")) return;
+          if (editingId === btn.getAttribute("data-id")) cancelEdit();
           await deleteBooking(btn.getAttribute("data-id"));
           renderAll();
         });
@@ -453,7 +501,40 @@
     function renderAll() { renderCalendar(); renderList(); }
 
     // =====================================================================
-    // ADD BOOKING
+    // EDIT MODE
+    // =====================================================================
+    function startEdit(id) {
+      const b = bookings.find(x => x.id === id);
+      if (!b) return;
+      editingId = id;
+      document.getElementById("guest").value = b.guest;
+      document.getElementById("email").value = b.email || "";
+      document.getElementById("room").value  = b.room;
+      document.getElementById("start").value = b.start;
+      document.getElementById("end").value   = b.end;
+      document.getElementById("form-title").textContent    = "Modifier votre séjour";
+      document.getElementById("add").textContent           = "Enregistrer les modifications";
+      document.getElementById("editing-banner").style.display = "block";
+      document.getElementById("cancel-edit").style.display   = "block";
+      document.getElementById("msg").className = "msg";
+      document.querySelector(".card:nth-child(2)").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    function cancelEdit() {
+      editingId = null;
+      document.getElementById("guest").value = "";
+      document.getElementById("email").value = "";
+      document.getElementById("start").value = iso(new Date());
+      document.getElementById("end").value   = "";
+      document.getElementById("form-title").textContent      = "Réservez votre séjour";
+      document.getElementById("add").textContent             = "Réserver mon séjour";
+      document.getElementById("editing-banner").style.display = "none";
+      document.getElementById("cancel-edit").style.display   = "none";
+      document.getElementById("msg").className = "msg";
+    }
+
+    // =====================================================================
+    // ADD / UPDATE BOOKING
     // =====================================================================
     function showMsg(text, type) {
       const el = document.getElementById("msg");
@@ -468,25 +549,28 @@
       const start = document.getElementById("start").value;
       const end   = document.getElementById("end").value;
 
-      if (!guest)              return showMsg("Dites-nous qui vient nous voir.", "error");
-      if (!email)              return showMsg("Ajoutez votre adresse e-mail pour recevoir la confirmation.", "error");
+      if (!guest)               return showMsg("Dites-nous qui vient nous voir.", "error");
+      if (!email)               return showMsg("Ajoutez votre adresse e-mail pour recevoir la confirmation.", "error");
       if (!isValidEmail(email)) return showMsg("Cette adresse e-mail ne semble pas valide.", "error");
-      if (!start || !end)      return showMsg("Choisissez vos dates d'arrivée et de départ.", "error");
-      if (end <= start)        return showMsg("La date de départ doit être après l'arrivée.", "error");
+      if (!start || !end)       return showMsg("Choisissez vos dates d'arrivée et de départ.", "error");
+      if (end <= start)         return showMsg("La date de départ doit être après l'arrivée.", "error");
 
       const btn = document.getElementById("add");
       btn.disabled = true;
-      btn.textContent = "Réservation en cours…";
+      btn.textContent = editingId ? "Mise à jour en cours…" : "Réservation en cours…";
 
-      const entry = {
-        id: String(Date.now()) + Math.floor(Math.random() * 1000),
-        guest, email, room, start, end
-      };
+      const entry = { guest, email, room, start, end };
+      let res;
 
-      const res = await addBooking(entry);
+      if (editingId) {
+        res = await updateBooking(editingId, entry);
+      } else {
+        entry.id = String(Date.now()) + Math.floor(Math.random() * 1000);
+        res = await addBooking(entry);
+      }
 
       btn.disabled = false;
-      btn.textContent = "Réserver mon séjour";
+      btn.textContent = editingId ? "Enregistrer les modifications" : "Réserver mon séjour";
 
       if (!res.ok) {
         if (res.error === "conflict") {
@@ -495,15 +579,19 @@
         return showMsg("Une erreur est survenue. Réessayez.", "error");
       }
 
+      const wasEditing = !!editingId;
+      cancelEdit();
       renderAll();
+
       const emailNote = SCRIPT_URL
-        ? `Un e-mail de confirmation a été envoyé à ${email}.`
-        : `(La confirmation par e-mail sera active dès que le backend est branché.)`;
-      showMsg(`Séjour réservé pour ${guest} ☀️ À très vite ! ${emailNote}`, "ok");
-      document.getElementById("guest").value = "";
-      document.getElementById("email").value = "";
-      document.getElementById("start").value = "";
-      document.getElementById("end").value = "";
+        ? ` Un e-mail de confirmation a été envoyé à ${email}.`
+        : "";
+      showMsg(
+        wasEditing
+          ? `Séjour de ${guest} mis à jour ☀️${emailNote}`
+          : `Séjour réservé pour ${guest} ☀️ À très vite !${emailNote}`,
+        "ok"
+      );
     }
 
     // Auto-init si déjà authentifié
